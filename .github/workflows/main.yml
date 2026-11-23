@@ -1,0 +1,154 @@
+name: Build LineageOS OTA and images
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: Android/LineageOS repo manifest URL
+        required: true
+        type: string
+      manifest_branch:
+        description: Manifest branch for this device port
+        required: true
+        type: string
+      device_codename:
+        description: Device codename used in out/target/product/<codename>
+        required: true
+        type: string
+      lunch_target:
+        description: Full lunch target, for example lineage_<codename>-userdebug
+        required: true
+        type: string
+      build_targets:
+        description: Space-separated build targets (bacon builds an OTA ZIP)
+        required: true
+        default: bacon bootimage vendorbootimage dtboimage vbmetaimage
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lineage-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Configure a self-hosted Ubuntu runner with the android-builder label.
+    # Android builds need substantially more disk/RAM than GitHub-hosted runners provide.
+    runs-on: [self-hosted, linux, x64, android-builder]
+    timeout-minutes: 360
+    env:
+      MANIFEST_URL: ${{ inputs.manifest_url }}
+      MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+      DEVICE_CODENAME: ${{ inputs.device_codename }}
+      LUNCH_TARGET: ${{ inputs.lunch_target }}
+      BUILD_TARGETS: ${{ inputs.build_targets }}
+
+    steps:
+      - name: Check runner and prepare swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          if [[ "${ID:-}" != ubuntu* && "${ID_LIKE:-}" != *ubuntu* && "${ID_LIKE:-}" != *debian* ]]; then
+            echo "This workflow requires an Ubuntu/Debian Linux self-hosted runner." >&2
+            exit 1
+          fi
+          available_gb=$(df -BG --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')
+          ram_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+          ram_gb=$((ram_kb / 1024 / 1024))
+          echo "Available workspace disk: ${available_gb} GiB; RAM: ${ram_gb} GiB"
+          if (( available_gb < 250 )); then
+            echo "Need at least 250 GiB free in the workspace filesystem. Add/attach storage to the runner." >&2
+            exit 1
+          fi
+          if (( ram_gb < 24 )); then
+            echo "Need at least 24 GiB RAM. Use a larger runner." >&2
+            exit 1
+          fi
+          swap_kb=$(awk '/SwapTotal:/ {print $2}' /proc/meminfo)
+          swap_gb=$((swap_kb / 1024 / 1024))
+          if (( swap_gb < 16 )); then
+            if ! sudo -n true 2>/dev/null; then
+              echo "At least 16 GiB swap is required; configure it on the runner or allow passwordless sudo for the runner account." >&2
+              exit 1
+            fi
+            sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=progress
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
+          free -h
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Validate build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEVICE_CODENAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid device codename" >&2; exit 1; }
+          [[ "$LUNCH_TARGET" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid lunch target" >&2; exit 1; }
+          [[ "$BUILD_TARGETS" =~ ^[A-Za-z0-9_.\ -]+$ ]] || { echo "Invalid build target list" >&2; exit 1; }
+          [[ "$MANIFEST_URL" == https://* || "$MANIFEST_URL" == ssh://* || "$MANIFEST_URL" == git@* ]] || { echo "Use an HTTPS or SSH manifest URL" >&2; exit 1; }
+
+      - name: Install repo tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl --fail --location --retry 5 https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod a+rx "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize and sync Android source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/android"
+          cd "$GITHUB_WORKSPACE/android"
+          repo init -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH" --git-lfs
+          if [[ -d "$GITHUB_WORKSPACE/local_manifests" ]]; then
+            mkdir -p .repo/local_manifests
+            cp -a "$GITHUB_WORKSPACE/local_manifests/." .repo/local_manifests/
+          fi
+          jobs=$(nproc)
+          (( jobs > 8 )) && jobs=8
+          repo sync -c -j"$jobs" --force-sync --no-clone-bundle
+
+      - name: Build OTA and requested images
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/android"
+          source build/envsetup.sh
+          lunch "$LUNCH_TARGET"
+          # Word splitting is intentional: BUILD_TARGETS is a space-separated list.
+          mka $BUILD_TARGETS
+
+      - name: Collect OTA and image artifacts
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          product_dir="$GITHUB_WORKSPACE/android/out/target/product/$DEVICE_CODENAME"
+          [[ -d "$product_dir" ]] || { echo "No product output found at $product_dir" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          while IFS= read -r -d '' file; do
+            relative=${file#"$product_dir"/}
+            mkdir -p "$GITHUB_WORKSPACE/artifacts/$(dirname "$relative")"
+            cp -a "$file" "$GITHUB_WORKSPACE/artifacts/$relative"
+          done < <(find "$product_dir" -type f \( -name '*.zip' -o -name '*.img' -o -name '*.tar' \) -print0)
+          if [[ -z "$(find "$GITHUB_WORKSPACE/artifacts" -type f -print -quit)" ]]; then
+            echo "Build finished but produced no OTA ZIP or image files." >&2
+            exit 1
+          fi
+          find "$GITHUB_WORKSPACE/artifacts" -type f -printf '%P (%s bytes)\n' | sort
+
+      - name: Upload OTA and image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-${{ inputs.device_codename }}-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
