@@ -1,0 +1,82 @@
+name: LineageOS OTA build
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: Remove the output directory before building
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lineage-ota-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, x64, android-build]
+    timeout-minutes: 1440
+    env:
+      MANIFEST_URL: ${{ vars.LINEAGE_MANIFEST_URL }}
+      MANIFEST_BRANCH: ${{ vars.LINEAGE_MANIFEST_BRANCH }}
+      DEVICE_CODENAME: ${{ vars.DEVICE_CODENAME }}
+      PRODUCT_NAME: ${{ vars.LINEAGE_PRODUCT_NAME }}
+
+    steps:
+      - name: Validate build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${MANIFEST_URL:?Set LINEAGE_MANIFEST_URL}"
+          : "${MANIFEST_BRANCH:?Set LINEAGE_MANIFEST_BRANCH}"
+          : "${DEVICE_CODENAME:?Set DEVICE_CODENAME}"
+          : "${PRODUCT_NAME:?Set LINEAGE_PRODUCT_NAME}"
+          [[ "$MANIFEST_URL" =~ ^https:// ]]
+          [[ "$MANIFEST_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]
+          [[ "$DEVICE_CODENAME" =~ ^[A-Za-z0-9_-]+$ ]]
+          [[ "$PRODUCT_NAME" =~ ^[A-Za-z0-9_-]+$ ]]
+          command -v repo >/dev/null
+          command -v java >/dev/null
+
+      - name: Initialize LineageOS source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lineage-src"
+          cd "$RUNNER_TEMP/lineage-src"
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+
+      - name: Sync source and device trees
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/lineage-src"
+          repo sync -c --force-sync --no-clone-bundle -j"$(nproc)"
+
+      - name: Clean output
+        if: ${{ inputs.clean_build }}
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/lineage-src/out"
+
+      - name: Build OTA package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/lineage-src"
+          source build/envsetup.sh
+          lunch "${PRODUCT_NAME}-userdebug"
+          mka otapackage
+
+      - name: Upload OTA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage-${{ vars.DEVICE_CODENAME }}-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/lineage-src/out/target/product/${{ vars.DEVICE_CODENAME }}/*ota*.zip
+            ${{ runner.temp }}/lineage-src/out/target/product/${{ vars.DEVICE_CODENAME }}/*target_files*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
